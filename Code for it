@@ -1,0 +1,326 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// --- Pin Definitions ---
+const int dataPin  = 23; 
+const int latchPin = 22; 
+const int clockPin = 21; 
+const int col9Pin  = 4;   
+const int rowPins[5] = {19, 18, 5, 17, 16};
+
+// --- Web Server Setup ---
+const char* ssid = "ESP32_Matrix"; 
+const char* password = "";         
+WebServer server(80);
+
+// --- Global Display Variables ---
+uint16_t frame[5] = {0, 0, 0, 0, 0};
+enum Mode { MODE_SCROLL, MODE_TIME, MODE_SNAKE, MODE_ANIM };
+Mode currentMode = MODE_SCROLL;
+
+// --- 1. Scrolling Text Variables ---
+const int MAX_BUFFER = 2000; 
+uint8_t textBuffer[MAX_BUFFER]; 
+int totalCols = 0;
+int scrollIndex = 0;
+unsigned long lastScrollTime = 0;
+int scrollSpeed = 120; 
+
+// --- 2. Time Variables ---
+int tHour = 12;
+int tMin = 0;
+int tSec = 0;
+unsigned long lastTimeTick = 0;
+
+// --- 3. Snake Game Variables ---
+int snakeX[45], snakeY[45];
+int snakeLen = 3;
+int foodX, foodY;
+int snakeDir = 1; 
+unsigned long lastSnakeTime = 0;
+const int snakeSpeed = 400; 
+bool snakeAlive = false;
+
+// --- 4. Animation Variables ---
+int currentAnim = 0; // 0 = Heart, 1 = Face
+int animFrameIdx = 0;
+unsigned long lastAnimTime = 0;
+int currentAnimDelay = 500;
+
+// Frame 1: Big Heart, Frame 2: Small Heart
+const uint16_t animHeart[2][5] = {
+  { 0b001101100, 0b011111110, 0b001111100, 0b000111000, 0b000010000 },
+  { 0b000000000, 0b000101000, 0b001111100, 0b000111000, 0b000010000 }
+};
+
+// Frame 1: Eyes Open, Frame 2: Eyes Closed (Blink)
+const uint16_t animFace[2][5] = {
+  { 0b011000110, 0b011000110, 0b000000000, 0b100000001, 0b011111110 },
+  { 0b000000000, 0b011000110, 0b000000000, 0b100000001, 0b011111110 }
+};
+
+// --- Custom 3x5 Font (A-Z, 0-9) ---
+const uint8_t font3x5[38][3] = {
+  {0x1E, 0x05, 0x1E}, {0x1F, 0x15, 0x0A}, {0x0E, 0x11, 0x11}, {0x1F, 0x11, 0x0E}, // A-D
+  {0x1F, 0x15, 0x11}, {0x1F, 0x05, 0x01}, {0x0E, 0x15, 0x1D}, {0x1F, 0x04, 0x1F}, // E-H
+  {0x11, 0x1F, 0x11}, {0x08, 0x10, 0x0F}, {0x1F, 0x04, 0x1B}, {0x1F, 0x10, 0x10}, // I-L
+  {0x1F, 0x02, 0x1F}, {0x1F, 0x02, 0x1C}, {0x0E, 0x11, 0x0E}, {0x1F, 0x05, 0x02}, // M-P
+  {0x0E, 0x15, 0x1F}, {0x1F, 0x05, 0x1A}, {0x12, 0x15, 0x09}, {0x01, 0x1F, 0x01}, // Q-T
+  {0x0F, 0x10, 0x0F}, {0x07, 0x18, 0x07}, {0x1F, 0x08, 0x1F}, {0x1B, 0x04, 0x1B}, // U-X
+  {0x03, 0x1C, 0x03}, {0x19, 0x15, 0x13},                                         // Y, Z
+  {0x1F, 0x11, 0x1F}, {0x00, 0x1F, 0x00}, {0x1D, 0x15, 0x17}, {0x15, 0x15, 0x1F}, // 0-3
+  {0x07, 0x04, 0x1F}, {0x17, 0x15, 0x1D}, {0x1F, 0x15, 0x1D}, {0x01, 0x01, 0x1F}, // 4-7
+  {0x1F, 0x15, 0x1F}, {0x17, 0x15, 0x1F},                                         // 8, 9
+  {0x00, 0x00, 0x00}, {0x00, 0x0A, 0x00}                                          // Space, Colon
+};
+
+// --- HTML Interface ---
+const char htmlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+  <title>Matrix OS</title>
+  <style>
+    body { font-family: Arial; text-align: center; background: #222; color: white; margin: 0; padding: 15px;}
+    .box { background: #333; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
+    input[type=text] { font-size: 18px; padding: 10px; width: 80%; border-radius: 5px; border: none; }
+    input[type=range] { width: 80%; margin: 15px 0; }
+    button { font-size: 16px; padding: 10px 15px; margin: 5px; border-radius: 5px; border: none; background: #008CBA; color: white; cursor: pointer;}
+    .btn-green { background: #4CAF50; }
+    .btn-red { background: #f44336; }
+    .btn-purple { background: #9c27b0; }
+    .joy-grid { display: grid; grid-template-columns: 60px 60px 60px; justify-content: center; gap: 10px; margin-top: 15px;}
+    .joy-btn { width: 60px; height: 60px; font-size: 24px; background: #555; border-radius: 10px; }
+    .joy-btn:active { background: #777; }
+  </style>
+  <script>
+    function send(url) { fetch(url); }
+    function sendText() { send('/msg?val=' + encodeURIComponent(document.getElementById('txt').value)); }
+    function setSpeed(val) { send('/speed?val=' + val); }
+    function syncTime() {
+      let d = new Date();
+      let hr = d.getHours().toString().padStart(2, '0');
+      let min = d.getMinutes().toString().padStart(2, '0');
+      let sec = d.getSeconds().toString().padStart(2, '0');
+      send('/time?val=' + hr + min + sec);
+    }
+  </script>
+</head>
+<body>
+  <h2>Matrix OS</h2>
+  
+  <div class="box">
+    <h3>Animations</h3>
+    <button class="btn-purple" onclick="send('/anim?val=0')">Beating Heart</button>
+    <button class="btn-purple" onclick="send('/anim?val=1')">Blinking Face</button>
+  </div>
+
+  <div class="box">
+    <h3>Text Display</h3>
+    <input type="text" id="txt" placeholder="Type a message..."><br><br>
+    <button onclick="sendText()">Scroll Text</button><br>
+    <input type="range" min="30" max="300" value="120" onchange="setSpeed(this.value)" dir="rtl">
+  </div>
+
+  <div class="box">
+    <h3>Static Clock</h3>
+    <button class="btn-green" onclick="syncTime()">Sync & Show Time</button>
+  </div>
+
+  <div class="box">
+    <h3>Snake Game</h3>
+    <button class="btn-red" onclick="send('/snake')">Start Game</button>
+    <div class="joy-grid">
+      <div></div>
+      <button class="joy-btn" onclick="send('/dir?val=0')">&#8593;</button>
+      <div></div>
+      <button class="joy-btn" onclick="send('/dir?val=3')">&#8592;</button>
+      <button class="joy-btn" onclick="send('/dir?val=2')">&#8595;</button>
+      <button class="joy-btn" onclick="send('/dir?val=1')">&#8594;</button>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// --- Helper Functions ---
+void spawnFood() {
+  bool onSnake;
+  do {
+    onSnake = false;
+    foodX = random(0, 9);
+    foodY = random(0, 5);
+    for(int i=0; i<snakeLen; i++) if(snakeX[i] == foodX && snakeY[i] == foodY) onSnake = true;
+  } while(onSnake);
+}
+
+void resetSnake() {
+  snakeLen = 3; snakeDir = 1; snakeAlive = true;
+  snakeX[0]=4; snakeY[0]=2; snakeX[1]=3; snakeY[1]=2; snakeX[2]=2; snakeY[2]=2;
+  spawnFood();
+}
+
+void loadText(String msg) {
+  msg.toUpperCase(); totalCols = 0;
+  for (int i = 0; i < 9; i++) textBuffer[totalCols++] = 0x00; 
+  for (int i = 0; i < msg.length(); i++) {
+    if (totalCols >= MAX_BUFFER - 15) break; 
+    char c = msg[i]; int fontIndex = 36;
+    if (c >= 'A' && c <= 'Z') fontIndex = c - 'A';
+    else if (c >= '0' && c <= '9') fontIndex = c - '0' + 26;
+    for (int col = 0; col < 3; col++) textBuffer[totalCols++] = font3x5[fontIndex][col];
+    textBuffer[totalCols++] = 0x00; 
+  }
+  for (int i = 0; i < 9; i++) textBuffer[totalCols++] = 0x00;
+  scrollIndex = 0;
+}
+
+// --- Web Handlers ---
+void setupWeb() {
+  server.on("/", []() { server.send(200, "text/html", htmlPage); });
+  
+  server.on("/msg", []() {
+    if (server.hasArg("val")) { loadText(server.arg("val")); currentMode = MODE_SCROLL; }
+    server.send(200);
+  });
+  
+  server.on("/speed", []() {
+    if (server.hasArg("val")) scrollSpeed = server.arg("val").toInt();
+    server.send(200);
+  });
+
+  server.on("/time", []() {
+    if (server.hasArg("val")) {
+      String val = server.arg("val");
+      if (val.length() >= 4) {
+        tHour = val.substring(0, 2).toInt(); tMin = val.substring(2, 4).toInt();
+        if (val.length() >= 6) tSec = val.substring(4, 6).toInt(); else tSec = 0;
+      }
+      lastTimeTick = millis(); currentMode = MODE_TIME;
+    }
+    server.send(200);
+  });
+
+  server.on("/snake", []() { resetSnake(); currentMode = MODE_SNAKE; server.send(200); });
+  server.on("/dir", []() {
+    if (server.hasArg("val")) {
+      int newDir = server.arg("val").toInt();
+      if (abs(newDir - snakeDir) != 2) snakeDir = newDir; 
+    }
+    server.send(200);
+  });
+
+  // New Animation Handler
+  server.on("/anim", []() {
+    if (server.hasArg("val")) {
+      currentAnim = server.arg("val").toInt();
+      animFrameIdx = 0;
+      currentMode = MODE_ANIM;
+      lastAnimTime = millis();
+    }
+    server.send(200);
+  });
+}
+
+void setup() {
+  pinMode(dataPin, OUTPUT); pinMode(latchPin, OUTPUT); pinMode(clockPin, OUTPUT); pinMode(col9Pin, OUTPUT);
+  for (int i = 0; i < 5; i++) { pinMode(rowPins[i], OUTPUT); digitalWrite(rowPins[i], LOW); }
+  WiFi.softAP(ssid, password);
+  setupWeb(); server.begin();
+  loadText("READY"); lastTimeTick = millis();
+}
+
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  // RTC Engine
+  if (now - lastTimeTick >= 1000) {
+    lastTimeTick += 1000; tSec++;
+    if (tSec >= 60) { tSec = 0; tMin++; if (tMin >= 60) { tMin = 0; tHour++; if (tHour >= 24) tHour = 0; } }
+  }
+
+  // MODE: ANIMATIONS
+  if (currentMode == MODE_ANIM) {
+    if (now - lastAnimTime >= currentAnimDelay) {
+      lastAnimTime = now;
+
+      // Draw the current frame
+      for (int r = 0; r < 5; r++) {
+        if (currentAnim == 0) frame[r] = animHeart[animFrameIdx][r]; // Heart
+        else frame[r] = animFace[animFrameIdx][r];                   // Face
+      }
+
+      // Dynamic Timing logic (makes it look alive instead of robotic)
+      if (currentAnim == 0) {
+        // Heartbeat timing: Thump (long wait), Thump (short wait)
+        currentAnimDelay = (animFrameIdx == 0) ? 700 : 150; 
+      } else {
+        // Face Blink timing: Eyes open for 3 seconds, closed for a quick 150ms blink
+        currentAnimDelay = (animFrameIdx == 0) ? 3000 : 150; 
+      }
+
+      // Cycle to the next frame
+      animFrameIdx++;
+      if (animFrameIdx > 1) animFrameIdx = 0;
+    }
+  }
+
+  // MODE: SCROLLING TEXT
+  else if (currentMode == MODE_SCROLL) {
+    if (now - lastScrollTime >= scrollSpeed) {
+      lastScrollTime = now;
+      for (int r = 0; r < 5; r++) {
+        frame[r] = 0;
+        for (int c = 0; c < 9; c++) {
+          if (scrollIndex + c < totalCols) {
+            if (textBuffer[scrollIndex + c] & (1 << r)) frame[r] |= (1 << c);
+          }
+        }
+      }
+      scrollIndex++; if (scrollIndex >= totalCols - 9) scrollIndex = 0;
+    }
+  }
+  
+  // MODE: STATIC TIME
+  else if (currentMode == MODE_TIME) {
+    bool showHour = ((now / 2000) % 2 == 0); 
+    int digit1 = showHour ? (tHour / 10) : (tMin / 10);
+    int digit2 = showHour ? (tHour % 10) : (tMin % 10);
+    int idx1 = digit1 + 26; int idx2 = digit2 + 26;
+    for (int r = 0; r < 5; r++) {
+      frame[r] = 0;
+      for(int c=0; c<3; c++) if (font3x5[idx1][c] & (1<<r)) frame[r] |= (1 << (c + 1));
+      for(int c=0; c<3; c++) if (font3x5[idx2][c] & (1<<r)) frame[r] |= (1 << (c + 5));
+    }
+  }
+
+  // MODE: SNAKE GAME
+  else if (currentMode == MODE_SNAKE && snakeAlive) {
+    if (now - lastSnakeTime >= snakeSpeed) {
+      lastSnakeTime = now;
+      for(int i = snakeLen-1; i > 0; i--) { snakeX[i] = snakeX[i-1]; snakeY[i] = snakeY[i-1]; }
+      if (snakeDir == 0) snakeY[0]--; if (snakeDir == 1) snakeX[0]++;
+      if (snakeDir == 2) snakeY[0]++; if (snakeDir == 3) snakeX[0]--;
+      if (snakeX[0] < 0) snakeX[0] = 8; if (snakeX[0] > 8) snakeX[0] = 0;
+      if (snakeY[0] < 0) snakeY[0] = 4; if (snakeY[0] > 4) snakeY[0] = 0;
+      for(int i=1; i<snakeLen; i++) if(snakeX[0] == snakeX[i] && snakeY[0] == snakeY[i]) snakeAlive = false; 
+      if (snakeX[0] == foodX && snakeY[0] == foodY) { if(snakeLen < 45) snakeLen++; spawnFood(); }
+      for(int r=0; r<5; r++) frame[r] = 0;
+      if ((now / 150) % 2 == 0) frame[foodY] |= (1 << foodX);
+      if (snakeAlive) { for(int i=0; i<snakeLen; i++) frame[snakeY[i]] |= (1 << snakeX[i]); } 
+      else { for(int r=0; r<5; r++) frame[r] = 0b111111111; loadText("DEAD"); currentMode = MODE_SCROLL; }
+    }
+  }
+
+  // --- HIGH-SPEED MULTIPLEXER ---
+  for (int row = 0; row < 5; row++) {
+    for (int i = 0; i < 5; i++) digitalWrite(rowPins[i], LOW);
+    byte shiftData = frame[row] & 0xFF; 
+    bool col9Data = (frame[row] >> 8) & 1; 
+    digitalWrite(col9Pin, col9Data ? HIGH : LOW);
+    digitalWrite(latchPin, LOW); shiftOut(dataPin, clockPin, MSBFIRST, shiftData); digitalWrite(latchPin, HIGH);
+    digitalWrite(rowPins[row], HIGH); delay(2); 
+  }
+}
